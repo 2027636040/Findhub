@@ -3,7 +3,7 @@ Import('rtconfig')
 from building import *
 
 cwd = GetCurrentDir()
-src = ["main.c", "fmdn_test_cmds.c", "fmdn_auth.c", "fmdn_store.c", "fmdn_rng.c"]
+src = ["main.c", "fmdn_test_cmds.c", "fmdn_auth.c", "fmdn_store.c", "fmdn_rng.c", "fmdn_flags.c"]
 
 CPPPATH = [cwd, str(Dir('#'))]
 CPPDEFINES=[]

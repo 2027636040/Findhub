@@ -77,12 +77,17 @@ typedef struct
 
     /* FMDN 密钥与 EID */
     uint8_t account_key[16];           /* Account Key(来自手机 App) */
+    uint8_t owner_account_key[16];     /* Owner Account Key(首次访问 Beacon Actions 时锁定) */
+    uint8_t has_owner_key;             /* 是否已锁定 owner account key */
+    uint8_t has_account_key;           /* 是否已下发 account key(用于 5 分钟未配网保护) */
     uint8_t eik[32];                   /* 临时身份密钥 EIK(32 字节)  */
     uint8_t is_provisioned;            /* 0 = 未配网,1 = 已设 EIK    */
     uint8_t ut_mode;                   /* 防恶意追踪模式:0=关,1=开  */
     uint8_t pairing_mode;              /* 配对模式:0=关,1=开(0x04 READ_EIK 需要) */
     uint8_t current_eid[FMDN_EID_LEN]; /* 当前临时标识 EID(20 字节)  */
+    uint8_t current_r[FMDN_EID_LEN];   /* 当前 EID 对应的标量 r(Hashed Flags 用,20B 大端) */
     rt_timer_t eid_timer;              /* EID 轮换定时器(1024 秒)    */
+    rt_timer_t provision_timer;        /* 配网保护定时器(下发 AK 后 5 分钟未配网则工厂复位) */
     uint32_t unix_time_offset;         /* 开机秒数 -> Unix 时间的偏移 */
 } app_env_t;
 
@@ -97,9 +102,12 @@ int aes_ecb_128_crypt(const uint8_t key[16], const uint8_t input[16],
 int aes_ecb_256_encrypt_block32(const uint8_t key_256[32], const uint8_t plain[32],
                                 uint8_t cipher[32]);
 
-/* EID 生成引擎。 */
+/* EID 生成引擎。
+ * r_out 可选(传 NULL 则忽略):输出 EID 对应的标量 r(20 字节大端),
+ * 供 Hashed Flags 计算使用。 */
 int fmdn_eid_generate(const uint8_t eik[32], uint32_t timestamp,
-                      uint8_t eid_out[FMDN_EID_LEN]);
+                      uint8_t eid_out[FMDN_EID_LEN],
+                      uint8_t r_out[FMDN_EID_LEN]);
 uint32_t fmdn_get_timestamp(void);
 void fmdn_eid_update(void);
 void fmdn_eid_timer_start(void);
@@ -107,6 +115,12 @@ void fmdn_eid_timer_start(void);
 /* 广播控制包装函数(隐藏广播上下文全局变量)。 */
 void ble_app_adv_start(void);
 void ble_app_adv_stop(void);
+
+/* 下发 account key 后调用:置位标志并启动 5 分钟未配网保护定时器。 */
+void fmdn_account_key_provisioned(void);
+
+/* 供测试命令调用:立即执行一次完整工厂复位(清 account key + EIK)。 */
+void fmdn_factory_reset_now(void);
 
 #ifdef __cplusplus
 }

@@ -93,6 +93,7 @@ static int cmd_fmdn_ak(int argc, char *argv[])
     }
 
     LOG_HEX("Account Key set", 16, env->account_key, 16);
+    fmdn_account_key_provisioned();   // 启动 5 分钟未配网保护(模拟"配对后"触发点)
     return 0;
 }
 MSH_CMD_EXPORT(cmd_fmdn_ak, Set FMDN Account Key (32 hex chars));
@@ -106,6 +107,10 @@ static int cmd_fmdn_stat(int argc, char *argv[])
 
     LOG_I("=== FMDN Device Status ===");
     LOG_I("Provisioned: %s", env->is_provisioned ? "YES" : "NO");
+    LOG_I("Has account key: %s, Owner key locked: %s, UT: %s",
+          env->has_account_key ? "YES" : "NO",
+          env->has_owner_key ? "YES" : "NO",
+          env->ut_mode ? "ON" : "OFF");
     LOG_HEX("Account Key", 16, env->account_key, 16);
     if (env->is_provisioned)
         LOG_HEX("EIK", 16, env->eik, 32);
@@ -195,7 +200,7 @@ static int cmd_fmdn_eid_test(int argc, char *argv[])
     LOG_I("Masked ts:  %u", ts & ~((1u << FMDN_EID_ROTATION_K) - 1));
 
     uint8_t eid[FMDN_EID_LEN];
-    int ret = fmdn_eid_generate(env->eik, ts, eid);
+    int ret = fmdn_eid_generate(env->eik, ts, eid, NULL);
     if (ret == 0)
     {
         LOG_HEX("Generated EID", 16, eid, FMDN_EID_LEN);
@@ -678,11 +683,11 @@ MSH_CMD_EXPORT(cmd_fmdn_rekeycmd, Generate 0x02 re-key write command: [newEIK64h
 // ------------------------------------------------------------
 static int cmd_fmdn_factory(int argc, char *argv[])
 {
-    int ret = fmdn_store_clear();
-    LOG_I("Factory clear %s (reset device to take effect)", ret == 0 ? "OK" : "no record");
+    fmdn_factory_reset_now();   // 立即清 account key + EIK + 持久化,广播切占位
+    LOG_I("Factory reset done");
     return 0;
 }
-MSH_CMD_EXPORT(cmd_fmdn_factory, Clear persisted FMDN provisioning state);
+MSH_CMD_EXPORT(cmd_fmdn_factory, Factory reset: clear account key + EIK + persisted state);
 
 // ------------------------------------------------------------
 // 切换配对模式(0x04 READ_EIK 需要在配对模式下才允许)

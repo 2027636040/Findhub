@@ -29,6 +29,8 @@
 #include "fmdn_store.h"
 // FMDN 硬件随机数(TRNG)封装(nonce 随机源)
 #include "fmdn_rng.h"
+// FMDN 广播帧 Hashed Flags 计算
+#include "fmdn_flags.h"
 
 
 #define LOG_TAG "ble_app"
@@ -141,32 +143,39 @@ static uint8_t ble_app_advertising_event(uint8_t event, void *context, void *dat
 // FMDN(Find My Device Network)广播帧
 // ============================================================
 // 帧格式(Service Data AD 类型 0x16,服务 UUID 0xFEAA):
-//   [0]    AD 长度 = 0x18(24 字节:1 字节 AD 类型 + 23 字节负载)
+//   [0]    AD 长度 = 0x18(24)不带 Hashed Flags / 0x19(25)带
 //   [1]    AD 类型 = 0x16(Service Data - 16 位 UUID)
 //   [2-3]  服务 UUID = 0xFEAA(小端:AA, FE)
 //   [4]    UT 字节 = 0x40(UT 关)或 0x41(UT 开)
 //   [5-24] EID = 20 字节临时标识符
+//   [25]   Hashed Flags(可选,仅 UT 模式开启时追加)
 // ============================================================
 
 #define FMDN_SERVICE_UUID    0xFEAA
-#define FMDN_AD_PAYLOAD_LEN  23        // 2(UUID) + 1(UT) + 20(EID) = 23(AD 类型之后的负载)
+#define FMDN_AD_PAYLOAD_LEN  23        // 2(UUID) + 1(UT) + 20(EID) = 23(不含 Hashed Flags)
 #define FMDN_AD_TOTAL_LEN    24        // 1(AD 类型) + 23(负载) = 24(AD 长度字段值)
 #define FMDN_UT_OFF          0x40
 #define FMDN_UT_ON           0x41
 
-static void fmdn_frame_build(uint8_t *data, uint8_t ut_byte, const uint8_t eid[20])
+// 构造 FMDN 广播帧。hashed_flags 非 NULL 时在 EID 后追加 1 字节,
+// AD 长度相应 +1。返回总帧字节数(含首部长度字节)。
+static uint8_t fmdn_frame_build(uint8_t *data, uint8_t ut_byte,
+                                const uint8_t eid[20], const uint8_t *hashed_flags)
 {
-    // AD 长度 = 1(AD 类型) + 2(UUID) + 1(UT) + 20(EID) = 24
-    data[0] = FMDN_AD_TOTAL_LEN;       // 24 = 0x18
-    // AD 类型:Service Data - 16 位 UUID
-    data[1] = 0x16;
-    // 服务 UUID 0xFEAA(小端)
-    data[2] = (uint8_t)(FMDN_SERVICE_UUID & 0xFF);       // 0xAA
+    uint8_t payload = FMDN_AD_PAYLOAD_LEN;      // 23(不含 Hashed Flags)
+    if (hashed_flags != NULL)
+        payload += 1;                           // 24(含 Hashed Flags)
+
+    data[0] = (uint8_t)(1 + payload);           // AD 长度 = 类型(1) + 负载
+    data[1] = 0x16;                             // AD 类型:Service Data - 16 位 UUID
+    data[2] = (uint8_t)(FMDN_SERVICE_UUID & 0xFF);        // 0xAA
     data[3] = (uint8_t)((FMDN_SERVICE_UUID >> 8) & 0xFF); // 0xFE
-    // UT 字节
-    data[4] = ut_byte;
-    // EID(20 字节)
-    rt_memcpy(&data[5], eid, 20);
+    data[4] = ut_byte;                          // UT 字节
+    rt_memcpy(&data[5], eid, 20);               // EID(20 字节)
+    if (hashed_flags != NULL)
+        data[25] = *hashed_flags;               // Hashed Flags(追加在 EID 之后)
+
+    return (uint8_t)(1 + data[0]);              // 首部长度字节 + AD
 }
 
 // ============================================================
@@ -445,7 +454,8 @@ cleanup:
 // 为当前时间生成 160 位 EID
 // 成功返回 0,并将临时标识符写入 eid[20]
 int fmdn_eid_generate(const uint8_t eik[32], uint32_t timestamp,
-                      uint8_t eid_out[FMDN_EID_LEN])
+                      uint8_t eid_out[FMDN_EID_LEN],
+                      uint8_t r_out[FMDN_EID_LEN])
 {
     int ret;
     uint8_t ts_block[32], r_bytes[32];
@@ -493,6 +503,16 @@ int fmdn_eid_generate(const uint8_t eik[32], uint32_t timestamp,
     MBEDTLS_MPI_CHK(mbedtls_mpi_read_binary(&r_prime, r_bytes, 32));
     MBEDTLS_MPI_CHK(mbedtls_mpi_read_string(&n, 16, SECP160R1_N));
     MBEDTLS_MPI_CHK(mbedtls_mpi_mod_mpi(&r, &r_prime, &n));
+
+    // (可选)输出标量 r,对齐到曲线大小 160 位(20 字节大端),供 Hashed Flags。
+    // r = r' mod n,而 n 略大于 2^160,故 r 极小概率达 21 字节;规范要求
+    // 截断高位到 160 位,这里先写 32 字节再取低 20 字节(避免 write_binary(20) 溢出报错)。
+    if (r_out != NULL)
+    {
+        uint8_t r_full[32];
+        MBEDTLS_MPI_CHK(mbedtls_mpi_write_binary(&r, r_full, sizeof(r_full)));
+        memcpy(r_out, &r_full[sizeof(r_full) - FMDN_EID_LEN], FMDN_EID_LEN);
+    }
 
     // 步骤 5:R = r × G(SECP160R1 上的标量乘)
     MBEDTLS_MPI_CHK(mbedtls_mpi_read_string(&p_mpi, 16, SECP160R1_P));
@@ -554,17 +574,33 @@ static uint8_t fmdn_ut_byte(app_env_t *env)
 static void fmdn_adv_set_frame(app_env_t *env, const uint8_t *eid)
 {
     sibles_advertising_para_t para = {0};
-    uint8_t frame_size = 1 + FMDN_AD_TOTAL_LEN;
+    uint8_t hashed = 0;
+    const uint8_t *hf = NULL;
 
-    para.adv_data.customized_data = rt_malloc(frame_size);
+    // 规范允许「不支持电量 + 非 UT 模式」时省略 Hashed Flags 字节;
+    // 故仅在 UT 模式开启时追加该字节(此时必已配网,current_r 有效)。
+    if (env->ut_mode && env->is_provisioned)
+    {
+        if (fmdn_hashed_flags(env->current_r, FMDN_EID_LEN, true,
+                              FMDN_BATT_UNSUPPORTED, &hashed) == 0)
+            hf = &hashed;
+    }
+
+    uint8_t frame_size = 1 + FMDN_AD_TOTAL_LEN + (hf ? 1 : 0);
+
+    // 分配 = 结构头(len 字段)+ AD 数据字节,避免 data[] 越界
+    para.adv_data.customized_data = rt_malloc(sizeof(sibles_adv_type_customize_t) + frame_size);
     if (!para.adv_data.customized_data)
         return;
 
-    fmdn_frame_build(para.adv_data.customized_data->data, fmdn_ut_byte(env), eid);
+    fmdn_frame_build(para.adv_data.customized_data->data, fmdn_ut_byte(env), eid, hf);
     para.adv_data.customized_data->len = frame_size;
     sibles_advertising_update_adv_and_scan_rsp_data(g_app_advertising_context,
                                                      &para.adv_data, NULL);
     rt_free(para.adv_data.customized_data);
+
+    if (hf)
+        LOG_I("ADV frame with hashed flags=0x%02X", hashed);
 }
 
 // 按当前状态刷新广播帧(已配网→真实 EID,否则占位 EID;UT 字节随 ut_mode)
@@ -583,7 +619,7 @@ void fmdn_eid_update(void)
         return;
 
     uint32_t ts = fmdn_get_timestamp();
-    int ret = fmdn_eid_generate(env->eik, ts, env->current_eid);
+    int ret = fmdn_eid_generate(env->eik, ts, env->current_eid, env->current_r);
     if (ret != 0)
     {
         LOG_E("EID generation failed: %d", ret);
@@ -599,6 +635,7 @@ void fmdn_eid_update(void)
 //(这里不能做重的加密运算 —— 定时器线程栈太小!)
 #define FMDN_MSG_EID_ROTATE  0xF0
 #define FMDN_MSG_ADV_REFRESH 0xF1   // 断开后刷新广播帧(使连接期间的更改生效)
+#define FMDN_MSG_FACTORY_RESET 0xF2 // 配网保护超时:主线程执行工厂复位
 static void fmdn_eid_timer_cb(void *parameter)
 {
     app_env_t *env = ble_app_get_env();
@@ -632,17 +669,101 @@ static void fmdn_eid_timer_stop(void)
     }
 }
 
-// 反配网(CLEAR_EIK):清密钥、停轮换、清持久化、广播切回占位 EID
-static void fmdn_unprovision(app_env_t *env)
+// ------------------------------------------------------------
+// 配网保护定时器:下发 account key 后若 5 分钟内未完成 FHN 配网,
+// 则工厂复位并清除 account key(规范 locator tag 要求)。
+// 定时器线程不做重活,仅通过邮箱通知主线程执行复位。
+// ------------------------------------------------------------
+#define FMDN_PROVISION_TIMEOUT_MS  (1 * 60 * 1000)   // 5 分钟
+
+static void fmdn_provision_timer_cb(void *parameter)
+{
+    app_env_t *env = ble_app_get_env();
+    if (env->mb_handle)
+        rt_mb_send(env->mb_handle, FMDN_MSG_FACTORY_RESET);
+}
+
+static void fmdn_provision_timer_stop(app_env_t *env)
+{
+    if (env->provision_timer)
+    {
+        rt_timer_stop(env->provision_timer);
+        rt_timer_delete(env->provision_timer);
+        env->provision_timer = NULL;
+    }
+}
+
+// 下发 account key 后调用:启动 5 分钟未配网保护(一次性定时器)
+static void fmdn_provision_timer_start(app_env_t *env)
+{
+    fmdn_provision_timer_stop(env);   // 先清旧的
+    env->provision_timer = rt_timer_create("fmdn_prov", fmdn_provision_timer_cb, NULL,
+                                            rt_tick_from_millisecond(FMDN_PROVISION_TIMEOUT_MS),
+                                            RT_TIMER_FLAG_ONE_SHOT | RT_TIMER_FLAG_SOFT_TIMER);
+    if (env->provision_timer)
+        rt_timer_start(env->provision_timer);
+}
+
+// ------------------------------------------------------------
+// Owner account key:首次访问 Beacon Actions 时,从已有 account key 中
+// 锁定一个作为 owner;工厂复位前不可更改(规范)。本项目为单 account key
+// 模型,故 owner 即当前 account key。
+// ------------------------------------------------------------
+static void fmdn_lock_owner_key(app_env_t *env, const uint8_t key[16])
+{
+    if (!env->has_owner_key)
+    {
+        rt_memcpy(env->owner_account_key, key, 16);
+        env->has_owner_key = 1;
+        LOG_I("Owner account key locked");
+    }
+}
+
+static bool fmdn_key_is_owner(app_env_t *env, const uint8_t key[16])
+{
+    return env->has_owner_key && (rt_memcmp(env->owner_account_key, key, 16) == 0);
+}
+
+// 已下发 account key:置位标志并启动 5 分钟未配网保护
+void fmdn_account_key_provisioned(void)
+{
+    app_env_t *env = ble_app_get_env();
+    env->has_account_key = 1;
+    if (!env->is_provisioned)
+        fmdn_provision_timer_start(env);
+    LOG_I("Account key provisioned (5-min unprovisioned guard armed)");
+}
+
+// ------------------------------------------------------------
+// 工厂复位:清 account key + EIK + owner key + 持久化 + 停所有定时器,
+// 广播切回占位 EID。用于:
+//   - CLEAR_EIK(规范:清 EIK 即工厂复位并清 account key)
+//   - 下发 account key 后 5 分钟未配网
+// ------------------------------------------------------------
+static void fmdn_factory_reset(app_env_t *env)
 {
     fmdn_eid_timer_stop();
+    fmdn_provision_timer_stop(env);
+
     env->is_provisioned = 0;
     env->ut_mode = 0;
+    env->has_account_key = 0;
+    env->has_owner_key = 0;
     memset(env->eik, 0, sizeof(env->eik));
+    memset(env->account_key, 0, sizeof(env->account_key));
+    memset(env->owner_account_key, 0, sizeof(env->owner_account_key));
     memset(env->current_eid, 0, sizeof(env->current_eid));
-    fmdn_store_clear();                     // 清除 flash 中的配网记录
+    memset(env->current_r, 0, sizeof(env->current_r));
+
+    fmdn_store_clear();                     // 清除 flash 中的配网记录(含 account key)
     fmdn_adv_set_frame(env, g_dummy_eid);   // 广播切回占位 EID(UT 关)
-    LOG_I("Unprovisioned: EIK cleared, advertising dummy EID");
+    LOG_I("Factory reset: account key + EIK cleared, advertising dummy EID");
+}
+
+// 供测试命令调用:立即执行一次完整工厂复位
+void fmdn_factory_reset_now(void)
+{
+    fmdn_factory_reset(ble_app_get_env());
 }
 
 // 设置 UT(防恶意追踪)模式:切换广播帧类型 0x40/0x41 并刷新广播
@@ -828,6 +949,10 @@ static uint8_t fmdn_gatts_set_cbk(uint8_t conn_idx, sibles_set_cbk_t *para)
             }
             LOG_I("Auth OK (DataID=0x%02X)", data_id);
 
+            // 账户 key 类操作(0x00-0x03)认证通过 → 首次锁定 owner account key
+            if (subkey_suffix == 0)
+                fmdn_lock_owner_key(env, auth_key);
+
             // 保存本次认证上下文,供响应 notify 计算认证段(同密钥 + 同 nonce)
             rt_memcpy(env->gatt.cur_key, auth_key, auth_key_len);
             env->gatt.cur_key_len = auth_key_len;
@@ -869,13 +994,15 @@ static uint8_t fmdn_gatts_set_cbk(uint8_t conn_idx, sibles_set_cbk_t *para)
         case FMDN_DATA_ID_READ_PROVISIONING_STATE:
         {
             // 响应:[状态(1B) | 当前 EID(20B)]
-            // 状态:0x00 = 未配网,0x01 = 已配网
+            // 状态位图:bit0(0x01)= EIK 已设;bit1(0x02)= 本次认证 key 匹配 owner account key
             uint8_t resp[21] = {0};
-            resp[0] = env->is_provisioned ? 0x01 : 0x00;
+            resp[0] = (env->is_provisioned ? 0x01 : 0x00)
+                    | (fmdn_key_is_owner(env, env->account_key) ? 0x02 : 0x00);
             if (env->is_provisioned)
                 memcpy(&resp[1], env->current_eid, FMDN_EID_LEN);
             fmdn_notify_response(env, data_id, resp, sizeof(resp));
-            LOG_I("Provisioning state: %s", env->is_provisioned ? "PROVISIONED" : "UNPROVISIONED");
+            LOG_I("Provisioning state: %s (flags=0x%02X)",
+                  env->is_provisioned ? "PROVISIONED" : "UNPROVISIONED", resp[0]);
             break;
         }
         case FMDN_DATA_ID_SET_EIK:
@@ -922,6 +1049,7 @@ static uint8_t fmdn_gatts_set_cbk(uint8_t conn_idx, sibles_set_cbk_t *para)
                 env->is_provisioned = 1;
                 LOG_HEX("EIK decrypted successfully", 16, env->eik, 32);
                 LOG_I("Device is now PROVISIONED!");
+                fmdn_provision_timer_stop(env);   // 配网完成,取消 5 分钟保护
                 fmdn_store_save(env);      // 持久化:配网状态写入 flash
                 fmdn_eid_update();         // 生成第一个 EID
                 fmdn_eid_timer_start();    // 启动轮换定时器
@@ -954,7 +1082,7 @@ static uint8_t fmdn_gatts_set_cbk(uint8_t conn_idx, sibles_set_cbk_t *para)
                 return 0x80;
             }
             LOG_I("CLEAR_EIK: EIK hash verified");
-            fmdn_unprovision(env);   // 清密钥 + 停轮换 + 清 flash + 广播切占位
+            fmdn_factory_reset(env);   // 规范:清 EIK 即工厂复位(并清 account key)
             fmdn_notify_response(env, data_id, NULL, 0);
             break;
         }
@@ -1105,7 +1233,7 @@ static void ble_app_ibeacon_advertising_start(void)
     if (env->is_provisioned)
     {
         // 生成第一个真实 EID
-        fmdn_eid_generate(env->eik, fmdn_get_timestamp(), env->current_eid);
+        fmdn_eid_generate(env->eik, fmdn_get_timestamp(), env->current_eid, env->current_r);
         eid_to_use = env->current_eid;
         LOG_I("Using real EID (provisioned)");
     }
@@ -1117,8 +1245,11 @@ static void ble_app_ibeacon_advertising_start(void)
 
     uint8_t frame_size = 1 + FMDN_AD_TOTAL_LEN;  // 1(长度字节) + 24 = 25 字节
 
-    para.adv_data.customized_data = rt_malloc(frame_size);
-    fmdn_frame_build(para.adv_data.customized_data->data, fmdn_ut_byte(env), eid_to_use);
+    // 分配 = 结构头(len 字段)+ AD 数据字节,避免 data[] 越界
+    para.adv_data.customized_data = rt_malloc(sizeof(sibles_adv_type_customize_t) + frame_size);
+    // 初始广播时 UT 必为关(开机默认),不带 Hashed Flags;UT 开启后经
+    // fmdn_adv_set_frame 刷新时再追加该字节。
+    fmdn_frame_build(para.adv_data.customized_data->data, fmdn_ut_byte(env), eid_to_use, NULL);
     para.adv_data.customized_data->len = frame_size;
 
 
@@ -1202,6 +1333,19 @@ int main(void)
             rt_thread_mdelay(200);
             fmdn_adv_refresh(env);
             LOG_I("ADV refreshed (ut_mode=%d, provisioned=%d)", env->ut_mode, env->is_provisioned);
+        }
+        else if (value == FMDN_MSG_FACTORY_RESET)
+        {
+            // 下发 account key 后 5 分钟仍未配网 → 工厂复位(清 account key)
+            if (!env->is_provisioned)
+            {
+                LOG_W("Provisioning guard expired (5 min), factory reset");
+                fmdn_factory_reset(env);
+            }
+            else
+            {
+                fmdn_provision_timer_stop(env);   // 已配网,清理一次性保护定时器
+            }
         }
     }
     return RT_EOK;
